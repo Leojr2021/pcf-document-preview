@@ -26,3 +26,14 @@ It displays content inside a modal window with zoom, scroll, and responsive layo
 
 ---
 
+## 📸 Screenshots
+
+### Modal View - Image
+![Modal Preview](screenshots/image.png)
+
+### Modal View - PDF
+![Inline Rendering](screenshots/pdf.png)
+
+### Preview Button
+![Zoom Controls](screenshots/preview-button.png)
+
