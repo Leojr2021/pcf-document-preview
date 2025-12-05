@@ -1,0 +1,40 @@
+<root>
+  <data name="EntityLogicalName_DisplayName" xml:space="preserve">
+    <value>Entity Logical Name</value>
+  </data>
+  <data name="EntityLogicalName_Description" xml:space="preserve">
+    <value>Example: gwm_careerdocument (singular logical name of the table)</value>
+  </data>
+
+
+  <data name="EntityPluralName_DisplayName" xml:space="preserve">
+    <value>Entity Plural Name (Plural Logical Name)</value>
+  </data>
+  <data name="EntityPluralName_Description" xml:space="preserve">
+    <value>Example: gwm_careerdocuments. This is the plural logical name used in Dataverse Web API URLs.</value>
+  </data>
+
+
+  <data name="FileColumnName_DisplayName" xml:space="preserve">
+    <value>File Column Name</value>
+  </data>
+  <data name="FileColumnName_Description" xml:space="preserve">
+    <value>Logical name of the File column. Example: gwm_attachment</value>
+  </data>
+
+
+  <data name="ViewerHeight_DisplayName" xml:space="preserve">
+    <value>Viewer Height</value>
+  </data>
+  <data name="ViewerHeight_Description" xml:space="preserve">
+    <value>Height (in pixels) for the preview area. Example: 500</value>
+  </data>
+
+
+  <data name="EnableDownload_DisplayName" xml:space="preserve">
+    <value>Enable Download Button</value>
+  </data>
+  <data name="EnableDownload_Description" xml:space="preserve">
+    <value>If enabled, users can download the document using the toolbar button.</value>
+  </data>
+</root>

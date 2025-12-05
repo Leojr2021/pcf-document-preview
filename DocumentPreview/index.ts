@@ -6,29 +6,26 @@ import { IInputs, IOutputs } from "./generated/ManifestTypes";
 import { renderAsync } from "docx-preview";
 import * as pdfjsLib from "pdfjs-dist";
 
-const pdfjsVersion = (pdfjsLib as any).version || "5.4.449";
-
-// Configure pdf.js worker from CDN (required for rendering PDFs)
-(pdfjsLib as any).GlobalWorkerOptions.workerSrc =
-    `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjsVersion}/build/pdf.worker.min.mjs`;
-
-export class DocumentPreview implements ComponentFramework.StandardControl<IInputs, IOutputs> {
+export class DocumentPreviewInline implements ComponentFramework.StandardControl<IInputs, IOutputs> {
     private context: ComponentFramework.Context<IInputs>;
     private notifyOutputChanged: () => void;
     private container: HTMLDivElement;
 
-    private previewButton: HTMLButtonElement;
-    private fileLabel: HTMLSpanElement;
-
-    private modalOverlay: HTMLDivElement | null = null;
-    private modalContent: HTMLDivElement | null = null;
-    private modalBody: HTMLDivElement | null = null;
+    // Inline preview elements
+    private previewContainer: HTMLDivElement | null = null;
+    private previewToolbarTitle: HTMLSpanElement | null = null;
+    private previewToolbarActions: HTMLDivElement | null = null;
+    private zoomWrapper: HTMLDivElement | null = null;
     private zoomLevel: number = 1;
 
     private currentFileUrl: string | null = null;
     private currentFileName: string | null = null;
     private currentMimeType: string | null = null;
     private currentDownloadUrl: string | null = null;
+
+    // Worker local de pdf.js
+    private pdfWorkerUrl: string | null = null;
+    private pdfWorkerUrlPromise: Promise<string> | null = null;
 
     constructor() { }
 
@@ -46,37 +43,101 @@ export class DocumentPreview implements ComponentFramework.StandardControl<IInpu
         this.notifyOutputChanged = notifyOutputChanged;
         this.container = container;
 
-        // Wrapper for button + status label
-        const wrapper = document.createElement("div");
-        wrapper.style.display = "flex";
-        wrapper.style.alignItems = "center";
-        wrapper.style.gap = "8px";
+        // Configurar pdf.js para usar el worker local (no CDN)
+        this.ensurePdfWorkerUrl()
+            .then((workerUrl) => {
+                (pdfjsLib as any).GlobalWorkerOptions.workerSrc = workerUrl;
+            })
+            .catch((err) => {
+                console.error("Error setting pdf.js workerSrc", err);
+            });
 
-        // Main "Preview document" button (simple style, model-driven friendly)
-        this.previewButton = document.createElement("button");
-        this.previewButton.innerText = "Preview document";
-        this.previewButton.onclick = () => this.onPreviewClick();
-        this.previewButton.style.padding = "4px 8px";
-        this.previewButton.style.fontSize = "12px";
-        this.previewButton.style.cursor = "pointer";
+        // Root = full preview panel (no button)
+        const root = document.createElement("div");
+        Object.assign(root.style, {
+            width: "100%",
+            boxSizing: "border-box"
+        });
 
-        // Status label (shows messages like "Checking attachment...")
-        this.fileLabel = document.createElement("span");
-        this.fileLabel.style.fontSize = "12px";
-        this.fileLabel.style.color = "#666";
+        // Preview container
+        this.previewContainer = document.createElement("div");
+        this.previewContainer.className = "gwm-doc-preview";
+        Object.assign(this.previewContainer.style, {
+            border: "1px solid #e1e1e1",
+            borderRadius: "4px",
+            backgroundColor: "#f5f5f5",
+            minHeight: this.getViewerHeight(),
+            maxHeight: this.getViewerHeight(),
+            overflow: "auto",
+            padding: "8px 12px",
+            boxSizing: "border-box"
+        });
 
-        wrapper.appendChild(this.previewButton);
-        wrapper.appendChild(this.fileLabel);
-        this.container.appendChild(wrapper);
+        // Toolbar (title + actions)
+        const toolbar = document.createElement("div");
+        Object.assign(toolbar.style, {
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            marginBottom: "8px",
+            fontSize: "12px"
+        });
+
+        this.previewToolbarTitle = document.createElement("span");
+        this.previewToolbarTitle.innerText = "Document preview";
+
+        this.previewToolbarActions = document.createElement("div");
+        Object.assign(this.previewToolbarActions.style, {
+            display: "flex",
+            gap: "6px"
+        });
+
+        // Zoom controls
+        const zOut = this.makeButton("−", () => this.applyZoom(this.zoomLevel - 0.1));
+        const zIn = this.makeButton("+", () => this.applyZoom(this.zoomLevel + 0.1));
+        const zReset = this.makeButton("100%", () => this.applyZoom(1));
+
+        this.previewToolbarActions.appendChild(zOut);
+        this.previewToolbarActions.appendChild(zIn);
+        this.previewToolbarActions.appendChild(zReset);
+
+        // Optional download button
+        if (this.context.parameters.EnableDownload.raw) {
+            const downloadBtn = this.makeButton("Download", () => this.downloadCurrentFile(), true);
+            this.previewToolbarActions.appendChild(downloadBtn);
+        }
+
+        toolbar.appendChild(this.previewToolbarTitle);
+        toolbar.appendChild(this.previewToolbarActions);
+
+        // Zoom wrapper (content area)
+        this.zoomWrapper = document.createElement("div");
+        this.zoomWrapper.setAttribute("data-zoom-wrapper", "true");
+        Object.assign(this.zoomWrapper.style, {
+            transformOrigin: "top left",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            gap: "16px",
+            padding: "16px",
+            boxSizing: "border-box",
+            width: "100%"
+        });
+
+        this.previewContainer.appendChild(toolbar);
+        this.previewContainer.appendChild(this.zoomWrapper);
+
+        root.appendChild(this.previewContainer);
+        this.container.appendChild(root);
+
+        // Initial zoom
+        this.applyZoom(1);
     }
 
     public updateView(context: ComponentFramework.Context<IInputs>): void {
         this.context = context;
-
-        this.fileLabel.innerText = "Checking attachment...";
-        this.previewButton.disabled = true;
-
-        void this.checkAttachmentAndUpdateUI();
+        // Every time the form refreshes, try to load the preview automatically
+        void this.autoLoadPreview();
     }
 
     public getOutputs(): IOutputs {
@@ -85,21 +146,63 @@ export class DocumentPreview implements ComponentFramework.StandardControl<IInpu
 
     public destroy(): void {
         this.cleanupFileUrl();
-        this.destroyModal();
+
+        if (this.pdfWorkerUrl) {
+            URL.revokeObjectURL(this.pdfWorkerUrl);
+            this.pdfWorkerUrl = null;
+        }
     }
 
-    // -------------------------------------------------------------------------
-    // Supported file types (extensions-based)
-    // -------------------------------------------------------------------------
+    private getViewerHeight(): string {
+        const h = this.context?.parameters?.ViewerHeight?.raw;
+        return h && h > 0 ? `${h}px` : "500px";
+    }
+// -------------------------------------------------------------------------
+// Worker local de pdf.js
+// -------------------------------------------------------------------------
+private ensurePdfWorkerUrl(): Promise<string> {
+    if (this.pdfWorkerUrlPromise) {
+        return this.pdfWorkerUrlPromise;
+    }
 
-    private readonly supportedMimeTypes: string[] = [
-        "application/pdf",
-        "application/msword",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "image/png",
-        "image/jpeg",
-        "image/gif"
-    ];
+    this.pdfWorkerUrlPromise = new Promise<string>((resolve, reject) => {
+        const workerPath = "pdf.worker.min.html"; 
+
+        this.context.resources.getResource(
+            workerPath,
+            (data: string) => {
+                try {
+                    
+                    const byteChars = atob(data);
+                    const byteNumbers = new Array(byteChars.length);
+                    for (let i = 0; i < byteChars.length; i++) {
+                        byteNumbers[i] = byteChars.charCodeAt(i);
+                    }
+                    const byteArray = new Uint8Array(byteNumbers);
+
+                    const blob = new Blob([byteArray], { type: "text/javascript" });
+                    const url = URL.createObjectURL(blob);
+                    this.pdfWorkerUrl = url;
+                    resolve(url);
+                } catch (e) {
+                    reject(e);
+                }
+            },
+            () => {
+                
+                reject(new Error("Error loading pdf.js worker resource"));
+            }
+        );
+    });
+
+    return this.pdfWorkerUrlPromise;
+}
+
+
+
+    // -------------------------------------------------------------------------
+    // Supported types
+    // -------------------------------------------------------------------------
 
     private readonly supportedExtensions: string[] = [
         "pdf",
@@ -112,22 +215,28 @@ export class DocumentPreview implements ComponentFramework.StandardControl<IInpu
     ];
 
     // -------------------------------------------------------------------------
-    // Attachment checking / enabling preview button
+    // Auto-load preview
     // -------------------------------------------------------------------------
 
-    /**
-     * Checks if the configured file column on the current record
-     * has a previewable file (based on extension).
-     */
-    private async checkAttachmentAndUpdateUI(): Promise<void> {
+    private async autoLoadPreview(): Promise<void> {
+        if (!this.zoomWrapper) return;
+
         const entityId = (this.context.mode as any).contextInfo?.entityId;
         const entityLogicalName = this.context.parameters.EntityLogicalName.raw;
         const fileColumnName = this.context.parameters.FileColumnName.raw;
 
-        if (!entityId || !entityLogicalName || !fileColumnName) {
-            this.fileLabel.innerText =
-                "Control is missing configuration (EntityLogicalName or FileColumnName).";
-            this.previewButton.disabled = true;
+        // New record not saved yet
+        if (!entityId) {
+            this.setInfoMessage(
+                "Save the record and upload a file to see the document preview."
+            );
+            return;
+        }
+
+        if (!entityLogicalName || !fileColumnName) {
+            this.setInfoMessage(
+                "Control is missing configuration (EntityLogicalName or FileColumnName)."
+            );
             return;
         }
 
@@ -138,24 +247,36 @@ export class DocumentPreview implements ComponentFramework.StandardControl<IInpu
                 fileColumnName
             );
 
-            if (hasPreview) {
-                this.fileLabel.innerText = "";
-                this.previewButton.disabled = false;
-            } else {
-                this.fileLabel.innerText = "No previewable file in Attachment.";
-                this.previewButton.disabled = true;
+            if (!hasPreview) {
+                this.setInfoMessage("No previewable file in Attachment.");
+                return;
             }
-        } catch (e) {
-            console.error("Error checking attachment", e);
-            this.fileLabel.innerText = "Could not check Attachment.";
-            this.previewButton.disabled = true;
+
+            // There is a supported file => download and render
+            const file = await this.downloadFile(entityLogicalName, entityId, fileColumnName);
+
+            this.currentFileName = file.fileName;
+            this.currentMimeType = file.mimeType;
+
+            this.cleanupFileUrl();
+            this.currentFileUrl = URL.createObjectURL(file.blob);
+
+            if (this.previewToolbarTitle) {
+                this.previewToolbarTitle.innerText = this.currentFileName || "Document preview";
+            }
+
+            await this.renderFilePreview(file);
+        } catch (err: any) {
+            console.error("Error loading document preview", err);
+
+            if (err.status === 403) {
+                this.setInfoMessage("You do not have permission to view this document.");
+            } else {
+                this.setInfoMessage("Error loading document preview.");
+            }
         }
     }
 
-    /**
-     * Uses Web API to retrieve the file column and its name, then decides
-     * if the extension is supported for inline preview.
-     */
     private async hasPreviewableAttachment(
         entityLogicalName: string,
         entityId: string,
@@ -170,223 +291,48 @@ export class DocumentPreview implements ComponentFramework.StandardControl<IInpu
 
         const fileRef = (record as any)[fileColumnName];
 
-        if (!fileRef) {
-            // No file value at all
-            return false;
-        }
+        if (!fileRef) return false;
 
         const fileName = ((record as any)[nameColumn] as string) || "";
-
-        if (!fileName) {
-            // There is a file but no name; allow preview as a fallback
-            return true;
-        }
+        if (!fileName) return true;
 
         const dot = fileName.lastIndexOf(".");
-        if (dot <= 0 || dot === fileName.length - 1) {
-            // No usable extension
-            return false;
-        }
+        if (dot <= 0 || dot === fileName.length - 1) return false;
 
         const ext = fileName.substring(dot + 1).toLowerCase();
         return this.supportedExtensions.includes(ext);
     }
 
-    // -------------------------------------------------------------------------
-    // Preview button handler
-    // -------------------------------------------------------------------------
+    private setInfoMessage(text: string): void {
+        if (!this.zoomWrapper) return;
 
-    private async onPreviewClick(): Promise<void> {
-        if (this.previewButton.disabled) {
-            return;
-        }
-
-        const entityId = (this.context.mode as any).contextInfo?.entityId;
-        const entityLogicalName = this.context.parameters.EntityLogicalName.raw;
-        const fileColumnName = this.context.parameters.FileColumnName.raw;
-
-        if (!entityId || !entityLogicalName || !fileColumnName) {
-            alert("Control is missing configuration (EntityLogicalName or FileColumnName).");
-            return;
-        }
-
-        try {
-            // Download file bytes + metadata
-            const file = await this.downloadFile(entityLogicalName, entityId, fileColumnName);
-
-            this.currentFileName = file.fileName;
-            this.currentMimeType = file.mimeType;
-
-            // Manage object URL lifecycle
-            this.cleanupFileUrl();
-            this.currentFileUrl = URL.createObjectURL(file.blob);
-
-            // Open modal and render the file inside
-            this.openModal();
-            await this.renderFilePreview(file);
-        } catch (err: any) {
-            console.error(err);
-
-            if (err.status === 403) {
-                alert("You do not have permission to view this document.");
-            } else {
-                alert("Error loading document preview.");
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Modal UI (model-driven / Fluent-like look and feel)
-    // -------------------------------------------------------------------------
-
-    /**
-     * Creates and shows the modal overlay + container with a Fluent-style header.
-     */
-    private openModal(): void {
-        // Ensure any previous modal is removed first
-        this.destroyModal();
-        this.zoomLevel = 1;
-
-        // Fullscreen overlay
-        this.modalOverlay = document.createElement("div");
-        Object.assign(this.modalOverlay.style, {
-            position: "fixed",
-            top: "0",
-            left: "0",
-            width: "100%",
-            height: "100%",
-            backgroundColor: "rgba(0,0,0,0.3)",
-            zIndex: "9999",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center"
-        });
-
-        // Central modal container
-        this.modalContent = document.createElement("div");
-        Object.assign(this.modalContent.style, {
-            backgroundColor: "#ffffff",
-            borderRadius: "6px",
-            boxShadow: "0 4px 12px rgba(0,0,0,0.2)",
-            width: "80%",
-            maxWidth: "1000px",
-            maxHeight: this.context.parameters.ViewerHeight.raw
-                ? `${this.context.parameters.ViewerHeight.raw}px`
-                : "600px",
-            display: "flex",
-            flexDirection: "column",
-            overflow: "hidden"
-        });
-
-        // Header (title + actions)
-        const header = document.createElement("div");
-        Object.assign(header.style, {
-            padding: "10px 16px",
-            borderBottom: "1px solid #e1e1e1",
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            backgroundColor: "#f3f2f1"
-        });
-
-        const title = document.createElement("div");
-        title.innerText = this.currentFileName || "Document preview";
-        Object.assign(title.style, {
-            fontWeight: "600",
-            fontSize: "14px",
-            color: "#323130"
-        });
-
-        const actions = document.createElement("div");
-        Object.assign(actions.style, {
-            display: "flex",
-            gap: "6px"
-        });
-
-        // Zoom controls
-        const zOut = this.makeButton("−", () => this.applyZoom(this.zoomLevel - 0.1));
-        const zIn = this.makeButton("+", () => this.applyZoom(this.zoomLevel + 0.1));
-        const zReset = this.makeButton("100%", () => this.applyZoom(1));
-
-        actions.appendChild(zOut);
-        actions.appendChild(zIn);
-        actions.appendChild(zReset);
-
-        // Optional "Download" button (primary style)
-        if (this.context.parameters.EnableDownload.raw) {
-            actions.appendChild(
-                this.makeButton("Download", () => {
-                    // Prefer direct download URL (Dataverse $value endpoint)
-                    if (this.currentDownloadUrl) {
-                        const link = document.createElement("a");
-                        link.href = this.currentDownloadUrl;
-                        link.download = this.currentFileName || "file";
-                        link.target = "_blank";
-                        document.body.appendChild(link);
-                        link.click();
-                        document.body.removeChild(link);
-                        return;
-                    }
-
-                    // Fallback: use object URL if available
-                    if (this.currentFileUrl) {
-                        const link = document.createElement("a");
-                        link.href = this.currentFileUrl;
-                        link.download = this.currentFileName || "file";
-                        document.body.appendChild(link);
-                        link.click();
-                        document.body.removeChild(link);
-                        return;
-                    }
-
-                    console.warn("No file URL available for download.");
-                }, true)
-            );
-        }
-
-        // Close button
-        actions.appendChild(this.makeButton("Close", () => this.destroyModal()));
-
-        header.appendChild(title);
-        header.appendChild(actions);
-
-        // Modal body area (scrollable preview region)
-        this.modalBody = document.createElement("div");
-        Object.assign(this.modalBody.style, {
-            flex: "1",
-            overflow: "auto",
-            backgroundColor: "#f5f5f5",
-            padding: "12px"
-        });
-
-        // Inner wrapper where PDF pages / images / docx content will be rendered
-        const zoomWrapper = document.createElement("div");
-        zoomWrapper.setAttribute("data-zoom-wrapper", "true");
-        Object.assign(zoomWrapper.style, {
-            transformOrigin: "top left",
-            display: "flex",
-            flexDirection: "column",
-            alignItems: "center",
-            gap: "16px",
+        this.zoomWrapper.innerHTML = "";
+        const block = document.createElement("div");
+        block.innerText = text;
+        Object.assign(block.style, {
             padding: "16px",
+            backgroundColor: "#ffffff",
+            borderRadius: "4px",
+            boxShadow: "0 1px 4px rgba(0,0,0,0.16)",
+            fontSize: "12px",
+            color: "#323130",
+            maxWidth: "700px",
+            textAlign: "center",
+            width: "100%",
             boxSizing: "border-box"
         });
 
-        this.modalBody.appendChild(zoomWrapper);
+        this.zoomWrapper.appendChild(block);
 
-        this.modalContent.appendChild(header);
-        this.modalContent.appendChild(this.modalBody);
-
-        this.modalOverlay.appendChild(this.modalContent);
-        document.body.appendChild(this.modalOverlay);
-
-        // Initialize zoom to 100%
-        this.applyZoom(1);
+        if (this.previewToolbarTitle) {
+            this.previewToolbarTitle.innerText = "Document preview";
+        }
     }
 
-    /**
-     * Creates a Fluent-like button (primary or secondary) for the modal header.
-     */
+    // -------------------------------------------------------------------------
+    // Buttons / zoom / download helpers
+    // -------------------------------------------------------------------------
+
     private makeButton(label: string, handler: () => void, isPrimary = false): HTMLButtonElement {
         const btn = document.createElement("button");
         btn.innerText = label;
@@ -400,7 +346,7 @@ export class DocumentPreview implements ComponentFramework.StandardControl<IInpu
             border: isPrimary ? "1px solid #106ebe" : "1px solid #8a8886",
             backgroundColor: isPrimary ? "#0078d4" : "#ffffff",
             color: isPrimary ? "#ffffff" : "#323130",
-            minWidth: "64px",
+            minWidth: "48px",
             transition: "background-color 0.15s ease, border-color 0.15s ease"
         });
 
@@ -415,32 +361,35 @@ export class DocumentPreview implements ComponentFramework.StandardControl<IInpu
         return btn;
     }
 
-    /**
-     * Removes the modal from DOM and cleans related references.
-     */
-    private destroyModal(): void {
-        if (this.modalOverlay && this.modalOverlay.parentNode) {
-            this.modalOverlay.parentNode.removeChild(this.modalOverlay);
-        }
-        this.modalOverlay = null;
-        this.modalContent = null;
-        this.modalBody = null;
-        this.cleanupFileUrl();
-    }
-
-    /**
-     * Applies a CSS transform-based zoom to the inner preview wrapper.
-     */
     private applyZoom(z: number): void {
-        if (!this.modalBody) return;
-        const zoomWrapper = this.modalBody.querySelector("[data-zoom-wrapper]") as HTMLDivElement;
+        if (!this.zoomWrapper) return;
         this.zoomLevel = Math.min(Math.max(z, 0.5), 3);
-        zoomWrapper.style.transform = `scale(${this.zoomLevel})`;
+        this.zoomWrapper.style.transform = `scale(${this.zoomLevel})`;
     }
 
-    /**
-     * Revokes any previously created object URL for the current file.
-     */
+    private downloadCurrentFile(): void {
+        if (this.currentDownloadUrl) {
+            const link = document.createElement("a");
+            link.href = this.currentDownloadUrl;
+            link.download = this.currentFileName || "file";
+            link.target = "_blank";
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            return;
+        }
+
+        if (this.currentFileUrl) {
+            const link = document.createElement("a");
+            link.href = this.currentFileUrl;
+            link.download = this.currentFileName || "file";
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            return;
+        }
+    }
+
     private cleanupFileUrl(): void {
         if (this.currentFileUrl) {
             URL.revokeObjectURL(this.currentFileUrl);
@@ -452,16 +401,12 @@ export class DocumentPreview implements ComponentFramework.StandardControl<IInpu
     // Dataverse Web API helpers
     // -------------------------------------------------------------------------
 
-    /**
-     * Builds the Dataverse file download URL for the given record and file column.
-     * Uses EntitySetName (configured in the manifest) to keep the control reusable.
-     */
     private async getFileUrl(
         _entityLogicalName: string,
         entityId: string,
         fileColumnName: string
     ): Promise<string> {
-        const entitySetName = this.context.parameters.EntitySetName.raw;
+        const entityPluralName = this.context.parameters.EntityPluralName.raw;
         const cleanId = (entityId || "").replace(/[{}]/g, "");
 
         const orgUrl =
@@ -471,15 +416,10 @@ export class DocumentPreview implements ComponentFramework.StandardControl<IInpu
 
         const normalizedColumn = (fileColumnName || "").trim();
 
-        const url = `${orgUrl}/api/data/v9.0/${entitySetName}(${cleanId})/${normalizedColumn}`;
-        console.log("DocumentPreview – fileUrl:", url);
+        const url = `${orgUrl}/api/data/v9.0/${entityPluralName}(${cleanId})/${normalizedColumn}`;
         return url;
     }
 
-    /**
-     * Retrieves the file from Dataverse using Web API metadata + file content endpoint.
-     * Returns a Blob plus the file name and resolved MIME type.
-     */
     private async downloadFile(
         entityLogicalName: string,
         entityId: string,
@@ -495,10 +435,9 @@ export class DocumentPreview implements ComponentFramework.StandardControl<IInpu
 
         const fileUrl = await this.getFileUrl(entityLogicalName, entityId, fileColumnName);
 
-        // Dataverse $value endpoint can be used for direct download from the header button
+        // Dataverse $value endpoint for direct download
         this.currentDownloadUrl = `${fileUrl}/$value`;
 
-        // Retrieve Base64 content via Web API
         const response = await fetch(fileUrl, {
             method: "GET",
             headers: {
@@ -550,34 +489,28 @@ export class DocumentPreview implements ComponentFramework.StandardControl<IInpu
     }
 
     // -------------------------------------------------------------------------
-    // File preview rendering (PDF / image / docx / fallback)
+    // Rendering (PDF / image / docx / fallback)
     // -------------------------------------------------------------------------
 
-    /**
-     * Renders the given file Blob into the modal body, using pdf.js, docx-preview
-     * or a simple image element, with a clean, card-like layout.
-     */
     private async renderFilePreview(file: { blob: Blob; fileName: string; mimeType: string }): Promise<void> {
-        if (!this.modalBody) return;
+        if (!this.zoomWrapper) return;
 
-        const zoomWrapper = this.modalBody.querySelector("[data-zoom-wrapper]") as HTMLDivElement;
+        const zoomWrapper = this.zoomWrapper;
         zoomWrapper.innerHTML = "";
 
-        // Ensure base styling for inner container
         Object.assign(zoomWrapper.style, {
             display: "flex",
             flexDirection: "column",
             alignItems: "center",
             gap: "16px",
             padding: "16px",
-            boxSizing: "border-box"
+            boxSizing: "border-box",
+            width: "100%"
         });
 
         const lower = file.fileName.toLowerCase();
         const mime = file.mimeType.toLowerCase();
-        console.log(file.fileName, file.mimeType, file.blob.size);
 
-        // Helper to create a unified informational block (loading / error / fallback)
         const createInfoBlock = (text: string): HTMLDivElement => {
             const div = document.createElement("div");
             div.innerText = text;
@@ -589,41 +522,58 @@ export class DocumentPreview implements ComponentFramework.StandardControl<IInpu
                 fontSize: "12px",
                 color: "#323130",
                 maxWidth: "700px",
-                textAlign: "center"
+                textAlign: "center",
+                width: "100%",
+                boxSizing: "border-box"
             });
             return div;
         };
 
-        // ---------- PDF PREVIEW ----------
+        // ---------------------------------------------------------------------
+        // PDF 
+        // ---------------------------------------------------------------------
         if (mime === "application/pdf" || lower.endsWith(".pdf")) {
             const loading = createInfoBlock("Loading PDF preview...");
             zoomWrapper.appendChild(loading);
 
             try {
+
+                await this.ensurePdfWorkerUrl().catch(() => { });
+
                 const arrayBuffer = await file.blob.arrayBuffer();
                 const pdf = await (pdfjsLib as any).getDocument({ data: arrayBuffer }).promise;
 
                 zoomWrapper.innerHTML = "";
 
-                const renderAllPages = true;
-                const numPages = renderAllPages ? pdf.numPages : 1;
+                // Available width inside the preview (minus padding)
+                const containerWidth =
+                    zoomWrapper.clientWidth ||
+                    this.previewContainer?.clientWidth ||
+                    800;
+                const renderWidth = containerWidth - 32;
 
+                const numPages = pdf.numPages;
                 for (let pageNum = 1; pageNum <= numPages; pageNum++) {
                     const page = await pdf.getPage(pageNum);
 
-                    const viewport = page.getViewport({ scale: 1.2 });
+                    // Base viewport to know original width
+                    const baseViewport = page.getViewport({ scale: 1 });
+                    const scale = renderWidth / baseViewport.width; // fit to width
+                    const viewport = page.getViewport({ scale });
 
                     const canvas = document.createElement("canvas");
                     const context2d = canvas.getContext("2d")!;
                     canvas.width = viewport.width;
                     canvas.height = viewport.height;
+
                     Object.assign(canvas.style, {
                         display: "block",
                         background: "#ffffff",
-                        borderRadius: "4px"
+                        borderRadius: "4px",
+                        width: "100%",
+                        height: "auto"
                     });
 
-                    // Wrap each page in a card-like container to match model-driven styling
                     const pageContainer = document.createElement("div");
                     Object.assign(pageContainer.style, {
                         backgroundColor: "#ffffff",
@@ -631,7 +581,9 @@ export class DocumentPreview implements ComponentFramework.StandardControl<IInpu
                         borderRadius: "6px",
                         boxShadow: "0 1px 4px rgba(0,0,0,0.16)",
                         margin: "0 auto",
-                        display: "inline-block"
+                        width: "100%",
+                        maxWidth: "100%",
+                        boxSizing: "border-box"
                     });
 
                     pageContainer.appendChild(canvas);
@@ -657,7 +609,9 @@ export class DocumentPreview implements ComponentFramework.StandardControl<IInpu
             return;
         }
 
-        // ---------- IMAGE PREVIEW ----------
+        // ---------------------------------------------------------------------
+        // IMAGE 
+        // ---------------------------------------------------------------------
         if (mime.startsWith("image/")) {
             const loading = createInfoBlock("Loading image preview...");
             zoomWrapper.appendChild(loading);
@@ -694,7 +648,6 @@ export class DocumentPreview implements ComponentFramework.StandardControl<IInpu
             };
 
             reader.onerror = () => {
-                console.error("Error reading image blob for preview");
                 zoomWrapper.innerHTML = "";
                 zoomWrapper.appendChild(
                     createInfoBlock(
@@ -708,7 +661,9 @@ export class DocumentPreview implements ComponentFramework.StandardControl<IInpu
             return;
         }
 
-        // ---------- DOCX PREVIEW ----------
+        // ---------------------------------------------------------------------
+        // DOCX  
+        // ---------------------------------------------------------------------
         if (lower.endsWith(".docx")) {
             const wordContainerOuter = document.createElement("div");
             Object.assign(wordContainerOuter.style, {
@@ -718,7 +673,8 @@ export class DocumentPreview implements ComponentFramework.StandardControl<IInpu
                 boxShadow: "0 1px 4px rgba(0,0,0,0.16)",
                 maxWidth: "900px",
                 width: "100%",
-                boxSizing: "border-box"
+                boxSizing: "border-box",
+                overflowX: "hidden"
             });
 
             const wordInner = document.createElement("div");
@@ -726,27 +682,58 @@ export class DocumentPreview implements ComponentFramework.StandardControl<IInpu
                 backgroundColor: "#ffffff",
                 padding: "16px",
                 borderRadius: "4px",
-                minHeight: "200px"
+                minHeight: "200px",
+                width: "100%",
+                maxWidth: "100%",
+                boxSizing: "border-box",
+                overflowX: "hidden"
             });
 
             wordContainerOuter.appendChild(wordInner);
             zoomWrapper.appendChild(wordContainerOuter);
 
-            await renderAsync(file.blob, wordInner);
+            // Render DOCX
+            await renderAsync(file.blob, wordInner, undefined, {
+                className: "docx-wrapper",
+                inWrapper: true
+            });
+
+            // Adjust styles for better fit
+            const wrappers = wordInner.querySelectorAll<HTMLElement>(".docx-wrapper, section.docx-wrapper");
+            wrappers.forEach(w => {
+                w.style.boxSizing = "border-box";
+                w.style.maxWidth = "100%";
+                w.style.width = "100%";
+                w.style.margin = "0 auto";
+                w.style.padding = "50px";
+            });
+
+            const docxEls = wordInner.querySelectorAll<HTMLElement>(".docx");
+            docxEls.forEach(el => {
+                el.style.maxWidth = "100%";
+                el.style.width = "100%";
+                el.style.boxSizing = "border-box";
+                el.style.margin = "0 auto";
+            });
+
             return;
         }
 
-        // ---------- LEGACY .DOC PREVIEW ----------
+        // Legacy .DOC
         if (lower.endsWith(".doc")) {
             const msg = createInfoBlock(
                 "This file is a legacy .doc format which cannot be rendered inline. Click the button below to open it in a new tab."
             );
 
-            const btn = this.makeButton("Open document", () => {
-                if (this.currentFileUrl) {
-                    window.open(this.currentFileUrl, "_blank");
-                }
-            }, true);
+            const btn = this.makeButton(
+                "Open document",
+                () => {
+                    if (this.currentFileUrl) {
+                        window.open(this.currentFileUrl, "_blank");
+                    }
+                },
+                true
+            );
 
             const actions = document.createElement("div");
             Object.assign(actions.style, {
@@ -771,7 +758,7 @@ export class DocumentPreview implements ComponentFramework.StandardControl<IInpu
             return;
         }
 
-        // ---------- FALLBACK ----------
+        // Fallback
         zoomWrapper.appendChild(
             createInfoBlock(`Preview is not available for this file type (${file.mimeType}).`)
         );
